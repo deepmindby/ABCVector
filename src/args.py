@@ -42,7 +42,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default="./outputs",
-        help="Directory to save outputs"
+        help="Base directory to save outputs (vectors saved to output_dir/{dataset}/)"
     )
     parser.add_argument(
         "--seed",
@@ -103,7 +103,6 @@ def parse_args():
     )
     
     # ==================== UA Vector Configuration ====================
-    # Based on Variational CoT Vectors (MAP estimation with Bayesian shrinkage)
     parser.add_argument(
         "--tau_squared",
         type=float,
@@ -232,6 +231,32 @@ def parse_args():
         action="store_true",
         default=True,
         help="Save extracted/learned vector"
+    )
+    
+    # ==================== Layer Sweep Configuration ====================
+    parser.add_argument(
+        "--layers",
+        type=str,
+        default=None,
+        help="Comma-separated layers to test (e.g., '0,5,10'). Default: all layers with step"
+    )
+    parser.add_argument(
+        "--layer_step",
+        type=int,
+        default=2,
+        help="Step size when testing all layers (e.g., 2 = test every 2nd layer)"
+    )
+    parser.add_argument(
+        "--baseline_accuracy",
+        type=float,
+        default=None,
+        help="Pre-computed baseline accuracy (use with --skip_baseline)"
+    )
+    parser.add_argument(
+        "--load_vectors_dir",
+        type=str,
+        default=None,
+        help="Load pre-trained vectors from directory (skip extraction/training)"
     )
     
     return parser.parse_args()

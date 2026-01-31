@@ -4,14 +4,16 @@ Layer sweep script for CoT Vectors.
 Evaluates injection at different layers to find optimal performance.
 
 Supports methods: extracted, learnable, ua (uncertainty-aware)
+
+All hyperparameters are defined in src/args.py
 """
 
-import argparse
 import os
 import torch
 from datetime import datetime
 from tqdm import tqdm
 
+from src.args import parse_args
 from src.models import CoTModelWrapper, load_tokenizer
 from src.data_utils import load_dataset
 from src.methods.extracted import ExtractedCoTVector
@@ -21,76 +23,20 @@ from src.eval import run_baseline_evaluation, run_injection_evaluation
 from src.utils import set_seed
 
 
+def get_output_dir(base_dir: str, dataset: str) -> str:
+    """Get dataset-specific output directory: output_dir/{dataset}/"""
+    output_dir = os.path.join(base_dir, dataset)
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Layer sweep for CoT vectors")
-    
-    # ==================== Model & Data ====================
-    parser.add_argument("--model_path", type=str, default="/home/haichao/TA/UACoTV/models/Qwen2.5-Math-7B")
-    parser.add_argument("--model_name", type=str, default="qwen", choices=["qwen", "llama"])
-    parser.add_argument("--data_path", type=str, default="/home/haichao/TA/UACoTV/data")
-    parser.add_argument("--dataset", type=str, default="gsm8k",
-                        choices=["gsm8k", "math_easy", "math_hard", "mmlu_pro"])
-    parser.add_argument("--output_dir", type=str, default="./outputs")
-    parser.add_argument("--num_support_samples", type=int, default=1000)
-    parser.add_argument("--num_test_samples", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    
-    # ==================== Method Selection ====================
-    parser.add_argument("--method", type=str, default="extracted",
-                        choices=["extracted", "learnable", "ua"],
-                        help="CoT Vector acquisition method")
-    
-    # ==================== Layer Selection ====================
-    parser.add_argument("--layers", type=str, default=None, 
-                        help="Comma-separated layers to test (e.g., '0,5,10'). Default: all layers")
-    parser.add_argument("--layer_step", type=int, default=2,
-                        help="Step size when testing all layers (e.g., 2 = test every 2nd layer)")
-    
-    # ==================== Generation Config ====================
-    parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--num_beams", type=int, default=3)
-    parser.add_argument("--use_early_stopping", action="store_true", default=False)
-    
-    # ==================== Evaluation Options ====================
-    parser.add_argument("--skip_baseline", action="store_true", default=False,
-                        help="Skip baseline evaluation, only evaluate injection")
-    parser.add_argument("--baseline_accuracy", type=float, default=None,
-                        help="Pre-computed baseline accuracy (use with --skip_baseline)")
-    
-    # ==================== Learnable Vector Config ====================
-    parser.add_argument("--lambda_val", type=float, default=0.5,
-                        help="Balance factor λ between alignment and CE loss")
-    parser.add_argument("--learning_rate", type=float, default=5e-3,
-                        help="Learning rate (will be overridden by tiered LR strategy for learnable method)")
-    parser.add_argument("--num_epochs", type=int, default=5,
-                        help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=2,
-                        help="Batch size for training")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
-                        help="Gradient accumulation steps (paper default: 2)")
-    parser.add_argument("--warmup_ratio", type=float, default=0.5,
-                        help="Warmup ratio for LR scheduler (paper default: 0.5)")
-    parser.add_argument("--weight_decay", type=float, default=1e-3,
-                        help="Weight decay for AdamW")
-    parser.add_argument("--max_length", type=int, default=1024,
-                        help="Max sequence length for learnable method")
-    
-    # ==================== UA Vector Config ====================
-    parser.add_argument("--tau_squared", type=float, default=1.0,
-                        help="Prior variance τ² for Bayesian shrinkage")
-    parser.add_argument("--min_variance", type=float, default=1e-6,
-                        help="Minimum variance for numerical stability")
-    
-    # ==================== Saving Options ====================
-    parser.add_argument("--save_vectors", action="store_true", default=False,
-                        help="Save vectors for each layer")
-    parser.add_argument("--load_vectors_dir", type=str, default=None,
-                        help="Load pre-trained vectors from directory (skip training)")
-    
-    args = parser.parse_args()
+    args = parse_args()
     
     set_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Create dataset-specific output directory
+    output_dir = get_output_dir(args.output_dir, args.dataset)
     
     # Print configuration
     print("=" * 70)
@@ -99,6 +45,7 @@ def main():
     print(f"Model:    {args.model_path.split('/')[-1]}")
     print(f"Method:   {args.method}")
     print(f"Dataset:  {args.dataset}")
+    print(f"Output:   {output_dir}")
     print(f"Support:  {args.num_support_samples}, Test: {args.num_test_samples}")
     print(f"Skip baseline: {args.skip_baseline}")
     if args.method == "learnable":
@@ -167,7 +114,7 @@ def main():
         if args.load_vectors_dir:
             vector_path = os.path.join(
                 args.load_vectors_dir,
-                f"{args.method}_{args.dataset}_L{layer_idx}.pt"
+                f"{args.method}_L{layer_idx}.pt"
             )
             if os.path.exists(vector_path):
                 print(f"  Loading vector from {vector_path}")
@@ -249,11 +196,11 @@ def main():
                 })
                 continue
         
-        # Save vector if requested
-        if args.save_vectors and vector is not None:
+        # Save vector if requested (to outputs/{dataset}/)
+        if args.save_vector and vector is not None:
             vector_path = os.path.join(
-                args.output_dir,
-                f"{args.method}_{args.dataset}_L{layer_idx}.pt"
+                output_dir,
+                f"{args.method}_L{layer_idx}.pt"
             )
             save_data = {"vector": vector.cpu(), "layer": layer_idx, "method": args.method}
             
@@ -316,6 +263,9 @@ def main():
     # Filter out errors
     valid_results = [r for r in results if 'error' not in r]
     
+    avg_accuracy = 0.0
+    avg_norm = 0.0
+    
     if valid_results:
         # Sort by accuracy
         valid_results.sort(key=lambda x: x['accuracy'], reverse=True)
@@ -353,11 +303,11 @@ def main():
         for r in error_results:
             print(f"  Layer {r['layer']}: {r['error'][:50]}...")
     
-    # Save results to file
+    # Save results to file (in outputs/{dataset}/)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     result_file = os.path.join(
-        args.output_dir, 
-        f"layer_sweep_{args.method}_{args.dataset}_{timestamp}.txt"
+        output_dir, 
+        f"layer_sweep_{args.method}_{timestamp}.txt"
     )
     
     with open(result_file, "w") as f:
@@ -403,10 +353,10 @@ def main():
     print(f"\nResults saved to {result_file}")
     
     # Save vectors paths if saved
-    if args.save_vectors and vectors_dict:
+    if args.save_vector and vectors_dict:
         vectors_file = os.path.join(
-            args.output_dir,
-            f"vectors_paths_{args.method}_{args.dataset}_{timestamp}.txt"
+            output_dir,
+            f"vectors_paths_{args.method}_{timestamp}.txt"
         )
         with open(vectors_file, "w") as f:
             for layer, path in sorted(vectors_dict.items()):

@@ -21,12 +21,21 @@ from src.eval import run_baseline_evaluation, run_injection_evaluation
 from src.utils import set_seed, setup_wandb
 
 
+def get_output_dir(base_dir: str, dataset: str) -> str:
+    """Get dataset-specific output directory: output_dir/{dataset}/"""
+    output_dir = os.path.join(base_dir, dataset)
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
 def main():
     args = parse_args()
     
     # Setup
     set_seed(args.seed)
-    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Create dataset-specific output directory
+    output_dir = get_output_dir(args.output_dir, args.dataset)
     
     # Print configuration
     print("=" * 60)
@@ -37,6 +46,7 @@ def main():
     print(f"Dataset: {args.dataset}")
     print(f"Layer: {args.layer_idx}")
     print(f"Mode: {args.mode}")
+    print(f"Output: {output_dir}")
     print(f"Beams: {args.num_beams}, Max tokens: {args.max_new_tokens}")
     
     # Print method-specific config
@@ -146,11 +156,11 @@ def main():
         else:
             raise ValueError(f"Unknown method: {args.method}")
         
-        # Save vector
+        # Save vector to outputs/{dataset}/
         if args.save_vector and vector is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            vector_filename = f"{args.method}_{args.dataset}_L{args.layer_idx}_{timestamp}.pt"
-            vector_path = os.path.join(args.output_dir, vector_filename)
+            vector_filename = f"{args.method}_L{args.layer_idx}_{timestamp}.pt"
+            vector_path = os.path.join(output_dir, vector_filename)
             
             # Prepare save data
             save_data = {
