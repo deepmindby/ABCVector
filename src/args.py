@@ -2,12 +2,13 @@
 Argument parser for CoT Vectors.
 All hyperparameters are defined here.
 
-Supports: Extracted, Learnable, Uncertainty-Aware (UA) methods.
+Supports: Extracted, Learnable, Uncertainty-Aware (UA), and ABC methods.
 
 Based on "Variational CoT Vectors" framework:
 - Extracted: Statistical aggregation to approximate posterior
 - Learnable: Gradient optimization for global reasoning patterns
 - UA: Bayesian shrinkage with uncertainty-aware gating
+- ABC: Adaptive Bayesian CoT Vector with variational inference
 """
 
 import argparse
@@ -56,8 +57,8 @@ def parse_args():
         "--method",
         type=str,
         default="extracted",
-        choices=["extracted", "learnable", "ua"],
-        help="CoT Vector acquisition method: extracted, learnable, or ua"
+        choices=["extracted", "learnable", "ua", "abc"],
+        help="CoT Vector acquisition method: extracted, learnable, ua, or abc"
     )
     parser.add_argument(
         "--mode",
@@ -167,6 +168,38 @@ def parse_args():
         help="Maximum sequence length for learnable method"
     )
     
+    # ==================== ABC Vector Configuration ====================
+    parser.add_argument(
+        "--abc_hidden_dim",
+        type=int,
+        default=512,
+        help="Hidden dimension for ABC prior/posterior MLP networks"
+    )
+    parser.add_argument(
+        "--kl_beta",
+        type=float,
+        default=1.0,
+        help="KL divergence weight in ELBO objective"
+    )
+    parser.add_argument(
+        "--kl_warmup_steps",
+        type=int,
+        default=0,
+        help="Number of warmup steps for KL weight (0 = no warmup)"
+    )
+    parser.add_argument(
+        "--sigma_min",
+        type=float,
+        default=1e-4,
+        help="Minimum sigma value for numerical stability in ABC"
+    )
+    parser.add_argument(
+        "--abc_learning_rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate for ABC networks (prior, posterior, gate)"
+    )
+    
     # ==================== Generation Configuration (Evaluation) ====================
     parser.add_argument(
         "--max_new_tokens",
@@ -231,6 +264,12 @@ def parse_args():
         action="store_true",
         default=True,
         help="Save extracted/learned vector"
+    )
+    parser.add_argument(
+        "--abc_checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to load pre-trained ABC checkpoint (prior/posterior/gate)"
     )
     
     # ==================== Layer Sweep Configuration ====================

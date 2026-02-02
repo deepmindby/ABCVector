@@ -11,16 +11,21 @@ Available methods based on Variational CoT Vectors framework:
 
 - UACoTVector: Uncertainty-Aware vectors with Bayesian shrinkage
   MAP estimation with structured prior for adaptive gating.
+
+- ABCCoTVector: Adaptive Bayesian CoT Vector with variational inference
+  Prior-posterior networks for dynamic, sample-specific vector injection.
 """
 
 from .base import BaseCoTVectorMethod
 from .extracted import ExtractedCoTVector
 from .learnable import LearnableCoTVector
 from .ua_vector import UACoTVector
+from .abc_vector import ABCCoTVector
 
 __all__ = [
     "BaseCoTVectorMethod",
     "ExtractedCoTVector",
     "LearnableCoTVector",
     "UACoTVector",
+    "ABCCoTVector",
 ]

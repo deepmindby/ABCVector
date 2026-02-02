@@ -6,3 +6,9 @@ models/
 config/
 *.json
 *.pt
+*.txt
+*.wandb
+*.pyc
+latest-run
+src/methods/__pycache__/
+src/methods/__pycache__/__init__.cpython-312.pyc

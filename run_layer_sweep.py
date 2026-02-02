@@ -3,7 +3,7 @@
 Layer sweep script for CoT Vectors.
 Evaluates injection at different layers to find optimal performance.
 
-Supports methods: extracted, learnable, ua (uncertainty-aware)
+Supports methods: extracted, learnable, ua (uncertainty-aware), abc (adaptive bayesian)
 
 All hyperparameters are defined in src/args.py
 """
@@ -19,6 +19,7 @@ from src.data_utils import load_dataset
 from src.methods.extracted import ExtractedCoTVector
 from src.methods.learnable import LearnableCoTVector
 from src.methods.ua_vector import UACoTVector
+from src.methods.abc_vector import ABCCoTVector
 from src.eval import run_baseline_evaluation, run_injection_evaluation
 from src.utils import set_seed
 
@@ -54,6 +55,11 @@ def main():
               f"lr={args.learning_rate} (tiered), λ={args.lambda_val}, max_len={args.max_length}")
     if args.method == "ua":
         print(f"UA Config: τ²={args.tau_squared}, min_var={args.min_variance}")
+    if args.method == "abc":
+        print(f"ABC Config: hidden_dim={args.abc_hidden_dim}, kl_beta={args.kl_beta}, "
+              f"kl_warmup={args.kl_warmup_steps}, sigma_min={args.sigma_min}, "
+              f"lr={args.abc_learning_rate}, epochs={args.num_epochs}, "
+              f"batch={args.batch_size}, grad_accum={args.gradient_accumulation_steps}")
     print("=" * 70)
     
     # Load model
@@ -110,6 +116,121 @@ def main():
         vector = None
         method = None
         
+        # ==================== ABC Method (special handling) ====================
+        if args.method == "abc":
+            try:
+                # Must reinitialize ABC for each layer (fresh prior/posterior/gate)
+                abc_method = ABCCoTVector(
+                    model_wrapper=model_wrapper,
+                    tokenizer=tokenizer,
+                    layer_idx=layer_idx,
+                    dataset_type=args.dataset,
+                    abc_hidden_dim=args.abc_hidden_dim,
+                    kl_beta=args.kl_beta,
+                    kl_warmup_steps=args.kl_warmup_steps,
+                    sigma_min=args.sigma_min,
+                    learning_rate=args.abc_learning_rate,
+                    weight_decay=args.weight_decay,
+                    warmup_ratio=args.warmup_ratio,
+                    num_epochs=args.num_epochs,
+                    batch_size=args.batch_size,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    max_length=args.max_length,
+                )
+                
+                # Check if we should load a pre-trained checkpoint
+                if args.load_vectors_dir:
+                    checkpoint_path = os.path.join(
+                        args.load_vectors_dir,
+                        f"abc_L{layer_idx}.pt"
+                    )
+                    if os.path.exists(checkpoint_path):
+                        print(f"  Loading ABC checkpoint from {checkpoint_path}")
+                        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                        target_device = model_wrapper.device
+                        abc_method.load_state_dict(checkpoint, device=target_device)
+                    else:
+                        print(f"  Checkpoint not found, training new ABC model...")
+                        abc_method.train(support_samples)
+                else:
+                    # Train ABC
+                    abc_method.train(support_samples)
+                
+                # Save checkpoint if requested
+                if args.save_vector:
+                    checkpoint_path = os.path.join(
+                        output_dir,
+                        f"abc_L{layer_idx}.pt"
+                    )
+                    save_data = {
+                        **abc_method.get_state_dict(),
+                        "args": vars(args),
+                    }
+                    torch.save(save_data, checkpoint_path)
+                    vectors_dict[layer_idx] = checkpoint_path
+                    print(f"  Saved ABC checkpoint to {checkpoint_path}")
+                
+                # Evaluate ABC
+                abc_results = abc_method.eval(
+                    test_samples=test_samples,
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    use_early_stopping=args.use_early_stopping,
+                )
+                
+                diff = abc_results['accuracy'] - baseline_accuracy if baseline_accuracy else 0
+                gate_val = abc_method.gate.item()
+                
+                result_entry = {
+                    'layer': layer_idx,
+                    'accuracy': abc_results['accuracy'],
+                    'diff': diff,
+                    'correct': abc_results['correct'],
+                    'total': abc_results['total'],
+                    'gate': gate_val,
+                }
+                
+                results.append(result_entry)
+                
+                print(f"  Layer {layer_idx:2d}: {abc_results['accuracy']:.2f}% "
+                      f"({abc_results['correct']}/{abc_results['total']}) "
+                      f"[{diff:+.2f}% vs baseline] gate={gate_val:.3f}")
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
+                    print(f"  Layer {layer_idx}: CUDA OOM - {e}")
+                    torch.cuda.empty_cache()
+                    results.append({
+                        'layer': layer_idx,
+                        'accuracy': 0,
+                        'diff': -baseline_accuracy if baseline_accuracy else 0,
+                        'error': f"CUDA OOM: {str(e)[:100]}",
+                    })
+                    continue
+                else:
+                    print(f"  Layer {layer_idx}: Error - {e}")
+                    results.append({
+                        'layer': layer_idx,
+                        'accuracy': 0,
+                        'diff': -baseline_accuracy if baseline_accuracy else 0,
+                        'error': str(e),
+                    })
+                    continue
+            except Exception as e:
+                print(f"  Layer {layer_idx}: Error - {e}")
+                results.append({
+                    'layer': layer_idx,
+                    'accuracy': 0,
+                    'diff': -baseline_accuracy if baseline_accuracy else 0,
+                    'error': str(e),
+                })
+                continue
+            
+            # Clear CUDA cache after each layer
+            torch.cuda.empty_cache()
+            continue
+        
+        # ==================== Other Methods (extracted, learnable, ua) ====================
         # Check if we should load a pre-trained vector
         if args.load_vectors_dir:
             vector_path = os.path.join(
@@ -264,7 +385,7 @@ def main():
     valid_results = [r for r in results if 'error' not in r]
     
     avg_accuracy = 0.0
-    avg_norm = 0.0
+    avg_metric = 0.0  # norm for others, gate for ABC
     
     if valid_results:
         # Sort by accuracy
@@ -272,29 +393,45 @@ def main():
         
         # Layer-wise average
         avg_accuracy = sum(r['accuracy'] for r in valid_results) / len(valid_results)
-        avg_norm = sum(r.get('vector_norm', 0) for r in valid_results) / len(valid_results)
+        
+        if args.method == "abc":
+            avg_metric = sum(r.get('gate', 0) for r in valid_results) / len(valid_results)
+            metric_name = "Average Gate Value"
+        else:
+            avg_metric = sum(r.get('vector_norm', 0) for r in valid_results) / len(valid_results)
+            metric_name = "Average Vector Norm"
+        
         print(f"\nLayer-wise Average: {avg_accuracy:.2f}%")
-        print(f"Average Vector Norm: {avg_norm:.2f}")
+        print(f"{metric_name}: {avg_metric:.2f}")
         
         print("\nTop 5 layers:")
         for r in valid_results[:5]:
             diff_str = f"({r['diff']:+.2f}%)" if baseline_accuracy else ""
-            norm_str = f"norm={r.get('vector_norm', 0):.1f}"
-            print(f"  Layer {r['layer']:2d}: {r['accuracy']:.2f}% {diff_str} {norm_str}")
+            if args.method == "abc":
+                metric_str = f"gate={r.get('gate', 0):.3f}"
+            else:
+                metric_str = f"norm={r.get('vector_norm', 0):.1f}"
+            print(f"  Layer {r['layer']:2d}: {r['accuracy']:.2f}% {diff_str} {metric_str}")
         
         if len(valid_results) > 5:
             print("\nBottom 5 layers:")
             for r in valid_results[-5:]:
                 diff_str = f"({r['diff']:+.2f}%)" if baseline_accuracy else ""
-                norm_str = f"norm={r.get('vector_norm', 0):.1f}"
-                print(f"  Layer {r['layer']:2d}: {r['accuracy']:.2f}% {diff_str} {norm_str}")
+                if args.method == "abc":
+                    metric_str = f"gate={r.get('gate', 0):.3f}"
+                else:
+                    metric_str = f"norm={r.get('vector_norm', 0):.1f}"
+                print(f"  Layer {r['layer']:2d}: {r['accuracy']:.2f}% {diff_str} {metric_str}")
         
         # Best layer
         best = valid_results[0]
         print(f"\n★ Best Layer: {best['layer']} with {best['accuracy']:.2f}%")
         if baseline_accuracy:
             print(f"  Improvement over baseline: {best['diff']:+.2f}%")
-        print(f"  Vector norm: {best.get('vector_norm', 0):.2f}")
+        if args.method == "abc":
+            print(f"  Gate value: {best.get('gate', 0):.4f}")
+        else:
+            print(f"  Vector norm: {best.get('vector_norm', 0):.2f}")
     
     # Error summary
     error_results = [r for r in results if 'error' in r]
@@ -333,35 +470,62 @@ def main():
             f.write(f"  Tau squared: {args.tau_squared}\n")
             f.write(f"  Min variance: {args.min_variance}\n")
         
-        f.write(f"\nLayer\tAccuracy\tDiff\tCorrect\tTotal\tNorm\n")
+        if args.method == "abc":
+            f.write(f"\nABC Config:\n")
+            f.write(f"  Hidden dim: {args.abc_hidden_dim}\n")
+            f.write(f"  KL beta: {args.kl_beta}\n")
+            f.write(f"  KL warmup steps: {args.kl_warmup_steps}\n")
+            f.write(f"  Sigma min: {args.sigma_min}\n")
+            f.write(f"  Learning rate: {args.abc_learning_rate}\n")
+            f.write(f"  Epochs: {args.num_epochs}\n")
+            f.write(f"  Batch size: {args.batch_size}\n")
+            f.write(f"  Grad accum: {args.gradient_accumulation_steps}\n")
+        
+        if args.method == "abc":
+            f.write(f"\nLayer\tAccuracy\tDiff\tCorrect\tTotal\tGate\n")
+        else:
+            f.write(f"\nLayer\tAccuracy\tDiff\tCorrect\tTotal\tNorm\n")
         f.write("-" * 70 + "\n")
         
         for r in sorted(results, key=lambda x: x['layer']):
             if 'error' in r:
                 f.write(f"{r['layer']}\tERROR\t-\t-\t-\t-\t{r['error'][:30]}\n")
             else:
-                f.write(f"{r['layer']}\t{r['accuracy']:.2f}\t{r['diff']:+.2f}\t"
-                        f"{r['correct']}\t{r['total']}\t{r.get('vector_norm', 0):.2f}\n")
+                if args.method == "abc":
+                    f.write(f"{r['layer']}\t{r['accuracy']:.2f}\t{r['diff']:+.2f}\t"
+                            f"{r['correct']}\t{r['total']}\t{r.get('gate', 0):.4f}\n")
+                else:
+                    f.write(f"{r['layer']}\t{r['accuracy']:.2f}\t{r['diff']:+.2f}\t"
+                            f"{r['correct']}\t{r['total']}\t{r.get('vector_norm', 0):.2f}\n")
         
         # Summary at the end
         if valid_results:
             f.write(f"\n" + "=" * 70 + "\n")
             f.write(f"Best Layer: {valid_results[0]['layer']} ({valid_results[0]['accuracy']:.2f}%)\n")
             f.write(f"Layer-wise Average: {avg_accuracy:.2f}%\n")
-            f.write(f"Average Vector Norm: {avg_norm:.2f}\n")
+            if args.method == "abc":
+                f.write(f"Average Gate Value: {avg_metric:.4f}\n")
+            else:
+                f.write(f"Average Vector Norm: {avg_metric:.2f}\n")
     
     print(f"\nResults saved to {result_file}")
     
-    # Save vectors paths if saved
+    # Save vectors/checkpoint paths if saved
     if args.save_vector and vectors_dict:
-        vectors_file = os.path.join(
-            output_dir,
-            f"vectors_paths_{args.method}_{timestamp}.txt"
-        )
-        with open(vectors_file, "w") as f:
+        if args.method == "abc":
+            paths_file = os.path.join(
+                output_dir,
+                f"checkpoints_paths_{args.method}_{timestamp}.txt"
+            )
+        else:
+            paths_file = os.path.join(
+                output_dir,
+                f"vectors_paths_{args.method}_{timestamp}.txt"
+            )
+        with open(paths_file, "w") as f:
             for layer, path in sorted(vectors_dict.items()):
                 f.write(f"Layer {layer}: {path}\n")
-        print(f"Vector paths saved to {vectors_file}")
+        print(f"{'Checkpoint' if args.method == 'abc' else 'Vector'} paths saved to {paths_file}")
     
     print("=" * 70)
     print("Done!")

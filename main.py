@@ -1,10 +1,11 @@
 """
 Main entry point for CoT Vectors.
 
-Supports three methods based on Variational CoT Vectors framework:
+Supports four methods based on Variational CoT Vectors framework:
 - Extracted: Statistical aggregation of activation differences
 - Learnable: Gradient optimization via teacher-student framework
 - UA: Uncertainty-Aware with Bayesian shrinkage
+- ABC: Adaptive Bayesian CoT Vector with variational inference
 """
 
 import os
@@ -17,6 +18,7 @@ from src.data_utils import load_dataset
 from src.methods.extracted import ExtractedCoTVector
 from src.methods.learnable import LearnableCoTVector
 from src.methods.ua_vector import UACoTVector
+from src.methods.abc_vector import ABCCoTVector
 from src.eval import run_baseline_evaluation, run_injection_evaluation
 from src.utils import set_seed, setup_wandb
 
@@ -66,6 +68,19 @@ def main():
         print(f"  Prior variance τ²: {args.tau_squared}")
         print(f"  Min variance: {args.min_variance}")
     
+    if args.method == "abc":
+        print("-" * 60)
+        print("Adaptive Bayesian CoT (ABC) Configuration:")
+        print(f"  Hidden dim: {args.abc_hidden_dim}")
+        print(f"  KL beta: {args.kl_beta}")
+        print(f"  KL warmup steps: {args.kl_warmup_steps}")
+        print(f"  Sigma min: {args.sigma_min}")
+        print(f"  Learning rate: {args.abc_learning_rate}")
+        print(f"  Epochs: {args.num_epochs}")
+        print(f"  Batch size: {args.batch_size}")
+        print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
+        print(f"  Max length: {args.max_length}")
+    
     print("=" * 60)
     
     # Setup WandB
@@ -96,6 +111,133 @@ def main():
         )
         print(f"Test set: {len(test_samples)} samples")
     
+    # ==================== Handle ABC method separately ====================
+    if args.method == "abc":
+        print(f"\n{'='*60}")
+        print("ABC Vector Processing")
+        print("=" * 60)
+        
+        # Initialize ABC method
+        abc_method = ABCCoTVector(
+            model_wrapper=model_wrapper,
+            tokenizer=tokenizer,
+            layer_idx=args.layer_idx,
+            dataset_type=args.dataset,
+            abc_hidden_dim=args.abc_hidden_dim,
+            kl_beta=args.kl_beta,
+            kl_warmup_steps=args.kl_warmup_steps,
+            sigma_min=args.sigma_min,
+            learning_rate=args.abc_learning_rate,
+            weight_decay=args.weight_decay,
+            warmup_ratio=args.warmup_ratio,
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            max_length=args.max_length,
+        )
+        
+        # Load checkpoint if provided
+        if args.abc_checkpoint_path:
+            print(f"\nLoading ABC checkpoint from {args.abc_checkpoint_path}")
+            checkpoint = torch.load(args.abc_checkpoint_path, map_location="cpu")
+            target_device = model_wrapper.device
+            abc_method.load_state_dict(checkpoint, device=target_device)
+            print("ABC checkpoint loaded successfully")
+        
+        # Training
+        if args.mode in ["train", "both"] and support_samples:
+            print("\nTraining ABC Vector...")
+            abc_method.train(support_samples, wandb_run)
+            
+            # Save checkpoint
+            if args.save_vector:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                checkpoint_filename = f"abc_L{args.layer_idx}_{timestamp}.pt"
+                checkpoint_path = os.path.join(output_dir, checkpoint_filename)
+                
+                save_data = {
+                    **abc_method.get_state_dict(),
+                    "args": vars(args),
+                }
+                torch.save(save_data, checkpoint_path)
+                print(f"ABC checkpoint saved to {checkpoint_path}")
+        
+        # Evaluation
+        if args.mode in ["eval", "both"] and test_samples:
+            print(f"\n{'='*60}")
+            print("Evaluation")
+            print("=" * 60)
+            
+            # Baseline evaluation
+            baseline_results = None
+            if not args.skip_baseline:
+                print("\n[1/2] Baseline (no injection)...")
+                baseline_results = run_baseline_evaluation(
+                    model_wrapper=model_wrapper,
+                    tokenizer=tokenizer,
+                    test_samples=test_samples,
+                    dataset_type=args.dataset,
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                    use_early_stopping=args.use_early_stopping,
+                )
+            
+            # ABC evaluation (dynamic vectors)
+            print(f"\n[2/2] ABC Vector (layer {args.layer_idx}, dynamic z*)...")
+            abc_results = abc_method.eval(
+                test_samples=test_samples,
+                max_new_tokens=args.max_new_tokens,
+                num_beams=args.num_beams,
+                use_early_stopping=args.use_early_stopping,
+            )
+            
+            # Print results
+            print("\n" + "=" * 60)
+            print("Results Summary")
+            print("-" * 60)
+            print(f"Model:      {args.model_path.split('/')[-1]}")
+            print(f"Method:     ABC")
+            print(f"Layer:      {args.layer_idx}")
+            print(f"Dataset:    {args.dataset}")
+            print(f"Test size:  {len(test_samples)}")
+            print("-" * 60)
+            
+            if baseline_results:
+                print(f"Baseline:   {baseline_results['accuracy']:.2f}% "
+                      f"({baseline_results['correct']}/{baseline_results['total']})")
+            
+            if baseline_results:
+                diff = abc_results['accuracy'] - baseline_results['accuracy']
+                sign = "+" if diff >= 0 else ""
+                print(f"ABC:        {abc_results['accuracy']:.2f}% "
+                      f"({abc_results['correct']}/{abc_results['total']}) [{sign}{diff:.2f}%]")
+            else:
+                print(f"ABC:        {abc_results['accuracy']:.2f}% "
+                      f"({abc_results['correct']}/{abc_results['total']})")
+            
+            print(f"Gate value: {abc_method.gate.item():.4f}")
+            print("=" * 60)
+            
+            # Log to WandB
+            if wandb_run:
+                if baseline_results:
+                    wandb_run.log({
+                        "eval/baseline_accuracy": baseline_results['accuracy'],
+                    })
+                wandb_run.log({
+                    "eval/abc_accuracy": abc_results['accuracy'],
+                    "eval/gate": abc_method.gate.item(),
+                })
+                if baseline_results:
+                    wandb_run.log({
+                        "eval/improvement": abc_results['accuracy'] - baseline_results['accuracy'],
+                    })
+                wandb_run.finish()
+        
+        print("\nDone!")
+        return
+    
+    # ==================== Handle other methods (extracted, learnable, ua) ====================
     # Get or load vector
     vector = None
     method = None
