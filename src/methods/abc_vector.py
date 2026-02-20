@@ -850,6 +850,8 @@ class ABCCoTVector(BaseCoTVectorMethod):
         # Get device
         target_layer = self.model_wrapper._get_layer(self.layer_idx)
         target_device = next(target_layer.parameters()).device
+
+        self._move_networks_to_device(target_device)
         
         # Create evaluator for generation
         from transformers import GenerationConfig
