@@ -8,6 +8,7 @@ ABC Vector 自动调参脚本
 - 自动记录日志和生成报告
 - 错误时发送邮件通知
 - 显示清晰的进度条
+- 自动保存最佳参数的模型向量到 outputs/{dataset}_best/
 
 使用方法：
     python abc_hyperparameter_search.py
@@ -19,6 +20,7 @@ import os
 import sys
 import json
 import time
+import shutil
 import logging
 import traceback
 import smtplib
@@ -41,11 +43,14 @@ MODEL_PATH = "/home/haichao/TA/ABCVector/models/Qwen2.5-Math-7B"
 MODEL_NAME = "qwen"  # "qwen" 或 "llama"
 
 # 数据集配置
-DATASET = "math_hard"  # "gsm8k", "math_easy", "math_hard", "mmlu_pro"
+DATASET = "math_easy"  # "gsm8k", "math_easy", "math_hard", "mmlu_pro"
 DATA_PATH = "/home/haichao/TA/ABCVector/data"
 
 # 输出路径
 RESULTS_DIR = "./results"
+
+# 最佳模型输出路径 (outputs/{dataset}_best/)
+BEST_OUTPUT_BASE = "./outputs"
 
 # 邮件配置 - 详细配置请修改 email_helper.py
 # 收件人邮箱
@@ -57,9 +62,9 @@ EMAIL_RECIPIENT = "byboyuanzhang@gmail.com"
 
 # 参数搜索空间
 PARAM_GRID = {
-    "kl_beta": [0.1, 0.5, 1.0, 2.0, 5.0],
-    "kl_warmup_steps": [0, 50, 100, 200, 500],
-    "abc_learning_rate": [1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+    "kl_beta": [0.5, 1.0, 2.0],
+    "kl_warmup_steps": [0],
+    "abc_learning_rate": [5e-5, 1e-4, 5e-4],
 }
 
 # 固定参数
@@ -238,6 +243,7 @@ class ABCHyperparameterSearch:
         param_grid: Dict[str, List],
         fixed_params: Dict[str, Any],
         layers: List[int],
+        best_output_base: str = "./outputs",
     ):
         self.model_path = model_path
         self.model_name = model_name
@@ -251,6 +257,18 @@ class ABCHyperparameterSearch:
         # 创建输出目录
         self.output_dir = os.path.join(results_dir, dataset)
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        # 最佳模型输出目录: outputs/{dataset}_best/
+        self.best_output_dir = os.path.join(best_output_base, f"{dataset}_best")
+        
+        # 当前全局最佳性能（用于判断是否需要更新）
+        self.best_avg_accuracy = -1.0
+        self.best_max_accuracy = -1.0
+        self.best_params = None
+        self.best_experiment_index = -1
+        
+        # 如果已有最佳目录，尝试加载之前的最佳性能
+        self._load_existing_best()
         
         # 设置日志
         self.logger = setup_logging(self.output_dir, dataset)
@@ -272,6 +290,21 @@ class ABCHyperparameterSearch:
         self.tokenizer = None
         self.support_samples = None
         self.test_samples = None
+    
+    def _load_existing_best(self):
+        """加载已有的最佳性能记录（用于恢复搜索）"""
+        meta_path = os.path.join(self.best_output_dir, "best_meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                self.best_avg_accuracy = meta.get("avg_accuracy", -1.0)
+                self.best_max_accuracy = meta.get("max_accuracy", -1.0)
+                self.best_params = meta.get("params", None)
+                print(f"📂 已加载历史最佳记录: 平均准确率={self.best_avg_accuracy:.2f}%, "
+                      f"最高准确率={self.best_max_accuracy:.2f}%")
+            except Exception as e:
+                print(f"⚠️ 无法加载历史最佳记录: {e}")
         
     def _generate_param_combinations(self) -> List[Dict[str, Any]]:
         """生成所有参数组合"""
@@ -331,10 +364,6 @@ class ABCHyperparameterSearch:
         
         from src.eval import run_baseline_evaluation
         
-        # 临时重定向输出以简化显示
-        import io
-        from contextlib import redirect_stdout
-        
         baseline_results = run_baseline_evaluation(
             model_wrapper=self.model_wrapper,
             tokenizer=self.tokenizer,
@@ -352,98 +381,104 @@ class ABCHyperparameterSearch:
         
         return accuracy
     
-    def _run_single_experiment(
+    def _save_best_checkpoints(
         self,
-        params: Dict[str, Any],
+        layer_checkpoints: Dict[int, Dict[str, Any]],
+        experiment_result: ExperimentResult,
         exp_idx: int,
-    ) -> ExperimentResult:
-        """运行单次实验"""
+    ):
+        """
+        保存最佳实验的所有层 checkpoint 到 outputs/{dataset}_best/
+        
+        目录结构:
+            outputs/{dataset}_best/
+            ├── best_meta.json          # 元信息（参数、性能、时间戳）
+            ├── abc_L0.pt               # 各层 checkpoint
+            ├── abc_L2.pt
+            ├── abc_L4.pt
+            └── ...
+        
+        Args:
+            layer_checkpoints: {layer_idx: state_dict} 各层的模型状态
+            experiment_result: 该实验的结果
+            exp_idx: 实验编号
+        """
         import torch
-        from src.methods.abc_vector import ABCCoTVector
         
-        result = ExperimentResult(params=params.copy())
-        result.status = "running"
+        self.logger.info("")
+        self.logger.info("🏆 发现新的最佳性能！保存最佳模型...")
+        self.logger.info(f"   旧最佳: 平均={self.best_avg_accuracy:.2f}%")
+        self.logger.info(f"   新最佳: 平均={experiment_result.avg_accuracy:.2f}%, "
+                        f"最高=L{experiment_result.best_layer} {experiment_result.max_accuracy:.2f}%")
         
-        start_time = time.time()
+        # 如果目录已存在，清空旧文件
+        if os.path.exists(self.best_output_dir):
+            shutil.rmtree(self.best_output_dir)
+        os.makedirs(self.best_output_dir, exist_ok=True)
         
-        try:
-            # 遍历每一层
-            for layer_idx in self.layers:
-                layer_start = time.time()
-                
-                try:
-                    # 创建 ABC 方法实例
-                    abc_method = ABCCoTVector(
-                        model_wrapper=self.model_wrapper,
-                        tokenizer=self.tokenizer,
-                        layer_idx=layer_idx,
-                        dataset_type=self.dataset,
-                        abc_hidden_dim=self.fixed_params["abc_hidden_dim"],
-                        kl_beta=params["kl_beta"],
-                        kl_warmup_steps=params["kl_warmup_steps"],
-                        sigma_min=self.fixed_params["sigma_min"],
-                        learning_rate=params["abc_learning_rate"],
-                        weight_decay=self.fixed_params["weight_decay"],
-                        warmup_ratio=self.fixed_params["warmup_ratio"],
-                        num_epochs=self.fixed_params["num_epochs"],
-                        batch_size=self.fixed_params["batch_size"],
-                        gradient_accumulation_steps=self.fixed_params["gradient_accumulation_steps"],
-                        max_length=self.fixed_params["max_length"],
-                    )
-                    
-                    # 训练（静默模式）
-                    abc_method.train(self.support_samples, wandb_run=None)
-                    
-                    # 评估
-                    eval_results = abc_method.eval(
-                        test_samples=self.test_samples,
-                        max_new_tokens=self.fixed_params["max_new_tokens"],
-                        num_beams=self.fixed_params["num_beams"],
-                        use_early_stopping=False,
-                    )
-                    
-                    layer_result = LayerResult(
-                        layer=layer_idx,
-                        accuracy=eval_results["accuracy"],
-                        correct=eval_results["correct"],
-                        total=eval_results["total"],
-                        gate=abc_method.gate.item(),
-                    )
-                    
-                except torch.cuda.OutOfMemoryError as e:
-                    # CUDA OOM
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    raise RuntimeError(f"CUDA OOM at layer {layer_idx}: {str(e)}")
-                    
-                except Exception as e:
-                    # 其他层级错误
-                    layer_result = LayerResult(
-                        layer=layer_idx,
-                        accuracy=0.0,
-                        correct=0,
-                        total=len(self.test_samples),
-                        error=str(e)[:200],
-                    )
-                
-                result.layer_results.append(layer_result)
-                
-                # 清理显存
-                torch.cuda.empty_cache()
-                gc.collect()
+        # 保存每一层的 checkpoint
+        saved_layers = []
+        for layer_idx, state_dict in sorted(layer_checkpoints.items()):
+            checkpoint_path = os.path.join(self.best_output_dir, f"abc_L{layer_idx}.pt")
             
-            # 计算统计
-            result.compute_stats()
-            result.status = "completed"
-            result.total_time = time.time() - start_time
-            
-        except Exception as e:
-            result.status = "failed"
-            result.error_message = str(e)
-            result.total_time = time.time() - start_time
-            raise
+            save_data = {
+                **state_dict,
+                "args": {
+                    **experiment_result.params,
+                    **self.fixed_params,
+                    "model_path": self.model_path,
+                    "model_name": self.model_name,
+                    "dataset": self.dataset,
+                    "layer_idx": layer_idx,
+                },
+            }
+            torch.save(save_data, checkpoint_path)
+            saved_layers.append(layer_idx)
         
-        return result
+        # 保存元信息
+        meta = {
+            "params": experiment_result.params,
+            "fixed_params": self.fixed_params,
+            "avg_accuracy": experiment_result.avg_accuracy,
+            "max_accuracy": experiment_result.max_accuracy,
+            "best_layer": experiment_result.best_layer,
+            "baseline_accuracy": self.search_results.baseline_accuracy,
+            "improvement_over_baseline": experiment_result.avg_accuracy - self.search_results.baseline_accuracy,
+            "experiment_index": exp_idx,
+            "total_time": experiment_result.total_time,
+            "saved_layers": saved_layers,
+            "model_path": self.model_path,
+            "model_name": self.model_name,
+            "dataset": self.dataset,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "layer_details": [
+                {
+                    "layer": lr.layer,
+                    "accuracy": lr.accuracy,
+                    "correct": lr.correct,
+                    "total": lr.total,
+                    "gate": lr.gate,
+                }
+                for lr in experiment_result.layer_results
+                if lr.error is None
+            ],
+        }
+        
+        meta_path = os.path.join(self.best_output_dir, "best_meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        
+        # 更新全局最佳记录
+        self.best_avg_accuracy = experiment_result.avg_accuracy
+        self.best_max_accuracy = experiment_result.max_accuracy
+        self.best_params = experiment_result.params.copy()
+        self.best_experiment_index = exp_idx
+        
+        self.logger.info(f"   已保存 {len(saved_layers)} 层 checkpoint 到: {self.best_output_dir}")
+        self.logger.info(f"   元信息: {meta_path}")
+        
+        print(f"  🏆 最佳模型已更新 → {self.best_output_dir} "
+              f"({len(saved_layers)} 层)")
     
     def run_search(self):
         """运行超参数搜索"""
@@ -457,6 +492,7 @@ class ABCHyperparameterSearch:
         self.logger.info(f"数据集: {self.dataset}")
         self.logger.info(f"测试层: {self.layers}")
         self.logger.info(f"参数组合总数: {len(self.param_combinations)}")
+        self.logger.info(f"最佳模型保存目录: {self.best_output_dir}")
         self.logger.info("")
         
         # 打印参数搜索空间
@@ -469,6 +505,10 @@ class ABCHyperparameterSearch:
         for param, value in self.fixed_params.items():
             self.logger.info(f"  {param}: {value}")
         self.logger.info("=" * 70)
+        
+        if self.best_avg_accuracy > 0:
+            self.logger.info(f"历史最佳: 平均={self.best_avg_accuracy:.2f}%, "
+                            f"参数={format_params(self.best_params) if self.best_params else 'N/A'}")
         
         # 加载模型和数据
         self._load_model_and_data()
@@ -502,6 +542,9 @@ class ABCHyperparameterSearch:
                 result.status = "running"
                 start_time = time.time()
                 
+                # 本次实验各层的 checkpoint（用于保存最佳模型）
+                layer_checkpoints = {}
+                
                 # 层级进度条
                 layer_pbar = tqdm(
                     self.layers, 
@@ -530,6 +573,9 @@ class ABCHyperparameterSearch:
                             total=eval_results["total"],
                             gate=abc_method.gate.item(),
                         )
+                        
+                        # 保存该层的 state_dict（内存中暂存）
+                        layer_checkpoints[layer_idx] = abc_method.get_state_dict()
                         
                         # 更新进度条显示
                         layer_pbar.set_postfix({
@@ -596,6 +642,19 @@ class ABCHyperparameterSearch:
                                     f"最佳层={result.best_layer}, "
                                     f"最佳准确率={result.max_accuracy:.2f}%, "
                                     f"耗时={format_time(result.total_time)}")
+                    
+                    # ========== 检查是否为全局最佳，保存最佳模型 ==========
+                    if result.avg_accuracy > self.best_avg_accuracy and layer_checkpoints:
+                        self._save_best_checkpoints(
+                            layer_checkpoints, result, exp_idx
+                        )
+                    else:
+                        self.logger.info(f"  当前: {result.avg_accuracy:.2f}% "
+                                        f"<= 最佳: {self.best_avg_accuracy:.2f}%, 不更新")
+                
+                # 释放本次实验的 checkpoint 内存
+                del layer_checkpoints
+                gc.collect()
                 
             except Exception as e:
                 error_msg = f"实验 {exp_num} 失败: {str(e)}"
@@ -626,6 +685,17 @@ class ABCHyperparameterSearch:
         self._generate_report()
         
         # 发送完成邮件
+        best_info = ""
+        if self.best_avg_accuracy > 0 and self.best_params:
+            best_info = (
+                f"\n全局最佳配置:\n{format_params(self.best_params)}\n\n"
+                f"全局最佳结果:\n"
+                f"  平均准确率: {self.best_avg_accuracy:.2f}%\n"
+                f"  最高准确率: {self.best_max_accuracy:.2f}%\n"
+                f"  提升: {self.best_avg_accuracy - baseline_acc:+.2f}%\n\n"
+                f"最佳模型已保存到: {self.best_output_dir}\n"
+            )
+        
         if self.search_results.best_experiment_idx >= 0:
             best_exp = self.search_results.experiments[self.search_results.best_experiment_idx]
             send_email(
@@ -633,12 +703,8 @@ class ABCHyperparameterSearch:
                 body=f"超参数搜索已完成！\n\n"
                      f"数据集: {self.dataset}\n"
                      f"完成实验: {self.search_results.completed_experiments}/{self.search_results.total_experiments}\n"
-                     f"基线准确率: {baseline_acc:.2f}%\n\n"
-                     f"最佳配置:\n{format_params(best_exp.params)}\n\n"
-                     f"最佳结果:\n"
-                     f"  平均准确率: {best_exp.avg_accuracy:.2f}%\n"
-                     f"  最佳层: L{best_exp.best_layer} ({best_exp.max_accuracy:.2f}%)\n"
-                     f"  提升: {best_exp.avg_accuracy - baseline_acc:+.2f}%\n\n"
+                     f"基线准确率: {baseline_acc:.2f}%\n"
+                     f"{best_info}\n"
                      f"详细报告已保存到: {self.output_dir}"
             )
     
@@ -666,31 +732,25 @@ class ABCHyperparameterSearch:
     
     def _train_silent(self, abc_method):
         """静默训练（隐藏详细输出）"""
-        import io
-        import sys
-        
-        # 重定向标准输出
         old_stdout = sys.stdout
         old_stderr = sys.stderr
-        sys.stdout = io.StringIO()
-        sys.stderr = io.StringIO()
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
         
         try:
             abc_method.train(self.support_samples, wandb_run=None)
         finally:
+            sys.stdout.close()
+            sys.stderr.close()
             sys.stdout = old_stdout
             sys.stderr = old_stderr
     
     def _eval_silent(self, abc_method) -> Dict[str, Any]:
         """静默评估（隐藏详细输出）"""
-        import io
-        import sys
-        
-        # 重定向标准输出
         old_stdout = sys.stdout
         old_stderr = sys.stderr
-        sys.stdout = io.StringIO()
-        sys.stderr = io.StringIO()
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
         
         try:
             results = abc_method.eval(
@@ -700,6 +760,8 @@ class ABCHyperparameterSearch:
                 use_early_stopping=False,
             )
         finally:
+            sys.stdout.close()
+            sys.stderr.close()
             sys.stdout = old_stdout
             sys.stderr = old_stderr
         
@@ -725,6 +787,9 @@ class ABCHyperparameterSearch:
             "total_experiments": self.search_results.total_experiments,
             "completed_experiments": self.search_results.completed_experiments,
             "failed_experiments": self.search_results.failed_experiments,
+            "best_avg_accuracy": self.best_avg_accuracy,
+            "best_params": self.best_params,
+            "best_output_dir": self.best_output_dir,
             "experiments": []
         }
         
@@ -785,6 +850,7 @@ class ABCHyperparameterSearch:
             f"- **测试层**: {self.layers}",
             f"- **开始时间**: {self.search_results.start_time}",
             f"- **结束时间**: {self.search_results.end_time}",
+            f"- **最佳模型目录**: `{self.best_output_dir}`",
             "",
             "### 参数搜索空间",
             "",
@@ -818,7 +884,58 @@ class ABCHyperparameterSearch:
         ])
         
         # 最佳结果
-        if self.search_results.best_experiment_idx >= 0:
+        if self.best_avg_accuracy > 0 and self.best_params:
+            improvement = self.best_avg_accuracy - self.search_results.baseline_accuracy
+            
+            report_lines.extend([
+                "## 3. 🏆 最佳配置（已保存到磁盘）",
+                "",
+                f"**保存位置**: `{self.best_output_dir}`",
+                "",
+                "### 最佳参数",
+                "",
+                "| 参数 | 值 |",
+                "|------|-----|",
+            ])
+            
+            for param, value in self.best_params.items():
+                report_lines.append(f"| {param} | {value} |")
+            
+            report_lines.extend([
+                "",
+                "### 最佳结果",
+                "",
+                f"- **平均准确率**: {self.best_avg_accuracy:.2f}%",
+                f"- **最高准确率**: {self.best_max_accuracy:.2f}%",
+                f"- **相比基线提升**: {improvement:+.2f}%",
+                "",
+            ])
+            
+            # 从 best_meta.json 加载各层详细结果
+            meta_path = os.path.join(self.best_output_dir, "best_meta.json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    
+                    layer_details = meta.get("layer_details", [])
+                    if layer_details:
+                        report_lines.extend([
+                            "### 各层详细结果",
+                            "",
+                            "| 层 | 准确率 | 正确/总数 | Gate值 | 相比基线 |",
+                            "|-----|--------|-----------|--------|----------|",
+                        ])
+                        
+                        for lr in sorted(layer_details, key=lambda x: x["accuracy"], reverse=True):
+                            diff = lr["accuracy"] - self.search_results.baseline_accuracy
+                            report_lines.append(
+                                f"| L{lr['layer']} | {lr['accuracy']:.2f}% | "
+                                f"{lr['correct']}/{lr['total']} | {lr['gate']:.4f} | {diff:+.2f}% |"
+                            )
+                except Exception:
+                    pass
+        elif self.search_results.best_experiment_idx >= 0:
             best_exp = self.search_results.experiments[self.search_results.best_experiment_idx]
             improvement = best_exp.avg_accuracy - self.search_results.baseline_accuracy
             
@@ -879,12 +996,13 @@ class ABCHyperparameterSearch:
         
         for rank, (idx, exp) in enumerate(sorted_experiments, 1):
             if exp.status == "completed":
+                is_best = " 🏆" if (self.best_params and exp.params == self.best_params) else ""
                 report_lines.append(
                     f"| {rank} | {exp.params['kl_beta']} | "
                     f"{exp.params['kl_warmup_steps']} | "
                     f"{exp.params['abc_learning_rate']} | "
                     f"{exp.avg_accuracy:.2f}% | L{exp.best_layer} | "
-                    f"{exp.max_accuracy:.2f}% | ✓ |"
+                    f"{exp.max_accuracy:.2f}% | ✓{is_best} |"
                 )
             else:
                 report_lines.append(
@@ -935,30 +1053,24 @@ class ABCHyperparameterSearch:
             report_lines.append("### 建议")
             report_lines.append("")
             
-            if self.search_results.best_experiment_idx >= 0:
-                best_exp = self.search_results.experiments[self.search_results.best_experiment_idx]
-                improvement = best_exp.avg_accuracy - self.search_results.baseline_accuracy
-                
-                if improvement > 0:
-                    report_lines.append(
-                        f"1. **推荐使用最佳配置**: kl_beta={best_exp.params['kl_beta']}, "
-                        f"kl_warmup_steps={best_exp.params['kl_warmup_steps']}, "
-                        f"abc_learning_rate={best_exp.params['abc_learning_rate']}"
-                    )
-                    report_lines.append(
-                        f"2. **最佳注入层**: Layer {best_exp.best_layer} "
-                        f"(准确率 {best_exp.max_accuracy:.2f}%)"
-                    )
-                    report_lines.append(
-                        f"3. **预期提升**: 相比基线提升 {improvement:+.2f}%"
-                    )
-                else:
-                    report_lines.append(
-                        "⚠️ 当前参数配置未能超越基线，建议：\n"
-                        "1. 扩大参数搜索范围\n"
-                        "2. 增加训练 epoch\n"
-                        "3. 检查数据质量"
-                    )
+            if self.best_avg_accuracy > self.search_results.baseline_accuracy:
+                report_lines.append(
+                    f"1. **推荐使用最佳配置**: {format_params(self.best_params)}"
+                )
+                report_lines.append(
+                    f"2. **最佳模型已保存到**: `{self.best_output_dir}`"
+                )
+                report_lines.append(
+                    f"3. **预期提升**: 相比基线提升 "
+                    f"{self.best_avg_accuracy - self.search_results.baseline_accuracy:+.2f}%"
+                )
+            else:
+                report_lines.append(
+                    "⚠️ 当前参数配置未能超越基线，建议：\n"
+                    "1. 扩大参数搜索范围\n"
+                    "2. 增加训练 epoch\n"
+                    "3. 检查数据质量"
+                )
         
         report_lines.extend([
             "",
@@ -977,8 +1089,12 @@ class ABCHyperparameterSearch:
         self.logger.info("=" * 70)
         self.logger.info(f"JSON 结果: {json_file}")
         self.logger.info(f"中文报告: {report_file}")
+        if self.best_avg_accuracy > 0:
+            self.logger.info(f"最佳模型: {self.best_output_dir}")
         
         print(f"\n📄 报告已保存到: {report_file}")
+        if self.best_avg_accuracy > 0:
+            print(f"🏆 最佳模型保存在: {self.best_output_dir}")
 
 
 # ============================================================================
@@ -987,12 +1103,15 @@ class ABCHyperparameterSearch:
 
 def main():
     """主函数"""
+    best_dir = os.path.join(BEST_OUTPUT_BASE, f"{DATASET}_best")
+    
     print("=" * 70)
     print("ABC Vector 超参数自动搜索")
     print("=" * 70)
     print(f"模型: {MODEL_PATH.split('/')[-1]}")
     print(f"数据集: {DATASET}")
     print(f"输出目录: {RESULTS_DIR}")
+    print(f"最佳模型目录: {best_dir}")
     print(f"参数组合数: {len(list(product(*PARAM_GRID.values())))}")
     print("=" * 70)
     
@@ -1007,6 +1126,7 @@ def main():
             param_grid=PARAM_GRID,
             fixed_params=FIXED_PARAMS,
             layers=LAYERS,
+            best_output_base=BEST_OUTPUT_BASE,
         )
         
         # 运行搜索
