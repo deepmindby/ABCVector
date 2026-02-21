@@ -222,7 +222,7 @@ def parse_args():
     parser.add_argument(
         "--use_early_stopping",
         action="store_true",
-        default=False,
+        default=True,
         help="Stop when answer pattern detected"
     )
     
