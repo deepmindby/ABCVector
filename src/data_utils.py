@@ -20,6 +20,73 @@ from transformers import PreTrainedTokenizer
 logger = logging.getLogger("cot_vectors")
 
 
+def _format_base_prompt(template_key: str, sample: "CoTSample", dataset_type: str) -> str:
+    """Format raw prompt template text for a sample."""
+    templates = PROMPT_TEMPLATES.get(dataset_type, PROMPT_TEMPLATES["gsm8k"])
+    if dataset_type == "mmlu_pro":
+        return templates[template_key].format(
+            question=sample.question,
+            choices=sample.choices or "",
+        )
+    return templates[template_key].format(question=sample.question)
+
+
+def _split_system_user_from_prompt(prompt: str) -> Tuple[str, str]:
+    """Split prompt text into system instruction and user question segments."""
+    marker = "\n\nQuestion:"
+    if marker in prompt:
+        system_part, question_part = prompt.split(marker, 1)
+        return system_part.strip(), f"Question:{question_part}".strip()
+    return prompt.strip(), ""
+
+
+def build_prompt(
+    template_key: str,
+    sample: "CoTSample",
+    dataset_type: str,
+    tokenizer: PreTrainedTokenizer,
+    model_name: str,
+    suffix: str = "",
+    assistant_text: Optional[str] = None,
+    add_generation_prompt: bool = True,
+) -> str:
+    """
+    Build prompt text for base/instruct models in a unified way.
+
+    - qwen/base models: returns plain formatted prompt + suffix/assistant_text
+    - llama instruct: returns chat-template formatted prompt
+    """
+    base_prompt = _format_base_prompt(template_key, sample, dataset_type)
+
+    if model_name != "llama":
+        out = base_prompt
+        if suffix:
+            out += suffix
+        if assistant_text is not None:
+            out += assistant_text
+        return out
+
+    system_msg, user_msg = _split_system_user_from_prompt(base_prompt)
+    if suffix:
+        user_msg = f"{user_msg}{suffix}"
+
+    messages = []
+    if system_msg:
+        messages.append({"role": "system", "content": system_msg})
+    if user_msg:
+        messages.append({"role": "user", "content": user_msg})
+
+    if assistant_text is not None:
+        messages.append({"role": "assistant", "content": assistant_text})
+        add_generation_prompt = False
+
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+
+
 # ==================== Prompt Templates (Table 3 in Appendix) ====================
 
 # Note: Use double braces {{}} to escape braces that should appear literally in output

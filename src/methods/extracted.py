@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from .base import BaseCoTVectorMethod
 from ..models import CoTModelWrapper
-from ..data_utils import PROMPT_TEMPLATES
+from ..data_utils import build_prompt
 
 
 class ExtractedCoTVector(BaseCoTVectorMethod):
@@ -27,7 +27,6 @@ class ExtractedCoTVector(BaseCoTVectorMethod):
         dataset_type: str = "gsm8k",
     ):
         super().__init__(model_wrapper, tokenizer, layer_idx, dataset_type)
-        self.prompt_template = PROMPT_TEMPLATES.get(dataset_type, PROMPT_TEMPLATES["gsm8k"])
     
     def _get_answer_positions(self, full_ids: torch.Tensor, qa_ids: torch.Tensor) -> torch.Tensor:
         """Get position indices of answer tokens."""
@@ -52,25 +51,24 @@ class ExtractedCoTVector(BaseCoTVectorMethod):
         device = self.model_wrapper.device
         
         # Build prompts
-        if self.dataset_type == "mmlu_pro":
-            cot_prompt = self.prompt_template["cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            ) + sample.cot + f"\nThe answer is {sample.answer}"
-            
-            non_cot_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            ) + f"The answer is {sample.answer}"
-        else:
-            cot_prompt = self.prompt_template["cot"].format(
-                question=sample.question
-            ) + sample.cot + f"\nThe answer is {sample.answer}"
-            
-            non_cot_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question
-            ) + f"The answer is {sample.answer}"
-        
+        cot_prompt = build_prompt(
+            template_key="cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_wrapper.model_name,
+            assistant_text=f"{sample.cot or ''}\nThe answer is {sample.answer}",
+        )
+
+        non_cot_prompt = build_prompt(
+            template_key="non_cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_wrapper.model_name,
+            assistant_text=f"The answer is {sample.answer}",
+        )
+
         # Tokenize
         cot_encoding = self.tokenizer(cot_prompt, return_tensors="pt", truncation=True, max_length=2048)
         non_cot_encoding = self.tokenizer(non_cot_prompt, return_tensors="pt", truncation=True, max_length=2048)

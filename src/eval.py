@@ -4,13 +4,17 @@ Evaluation logic for CoT Vectors.
 
 import torch
 import re
+import logging
 from typing import Optional, List, Dict, Any
 from tqdm import tqdm
 from transformers import GenerationConfig, StoppingCriteria, StoppingCriteriaList
 
-from .models import CoTModelWrapper, load_tokenizer
-from .data_utils import PROMPT_TEMPLATES
+from .models import CoTModelWrapper
+from .data_utils import build_prompt
 from .utils import extract_answer_from_text, compare_answers
+
+
+logger = logging.getLogger("cot_vectors")
 
 
 class AnswerStoppingCriteria(StoppingCriteria):
@@ -91,8 +95,6 @@ class CoTEvaluator:
         
         self.generation_config = GenerationConfig(**gen_kwargs)
         
-        # Get prompt template
-        self.prompt_template = PROMPT_TEMPLATES.get(dataset_type, PROMPT_TEMPLATES["gsm8k"])
     
     def evaluate_sample(
         self,
@@ -103,13 +105,14 @@ class CoTEvaluator:
     ) -> Dict[str, Any]:
         """Evaluate a single sample."""
         # Build prompt
-        if self.dataset_type == "mmlu_pro":
-            prompt = self.prompt_template["cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            )
-        else:
-            prompt = self.prompt_template["cot"].format(question=sample.question)
+        prompt = build_prompt(
+            template_key="cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_wrapper.model_name,
+            add_generation_prompt=True,
+        )
         
         # Tokenize
         device = self.model_wrapper.device
@@ -147,6 +150,14 @@ class CoTEvaluator:
         # Extract answer
         predicted = extract_answer_from_text(generated_text, self.dataset_type)
         is_correct = compare_answers(predicted, sample.answer, self.dataset_type)
+
+        if not is_correct:
+            logger.debug(
+                "Prediction mismatch | generated[:200]=%r | extracted=%r | ground_truth=%r",
+                generated_text[:200],
+                predicted,
+                sample.answer,
+            )
         
         # Clear hooks
         self.model_wrapper.clear_hooks()
