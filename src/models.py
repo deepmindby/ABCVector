@@ -2,10 +2,57 @@
 Model wrapper with hook mechanisms for CoT Vector injection and extraction.
 """
 
+import os
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import Optional, Dict, List, Callable
+from typing import Optional, Dict, List, Callable, Tuple
+
+
+def infer_model_name(model_path: str) -> str:
+    """Infer model family from path name when model_name is not explicitly provided."""
+    path_lower = os.path.basename(model_path).lower()
+    if "llama" in path_lower:
+        return "llama"
+    if "qwen" in path_lower:
+        return "qwen"
+    raise ValueError(
+        f"Cannot infer model type from path: {model_path}. "
+        "Please pass --model_name explicitly."
+    )
+
+
+def parse_model_specs(model_path_arg: str, model_name_arg: str) -> List[Tuple[str, str]]:
+    """
+    Parse model path/name arguments into aligned (model_path, model_name) pairs.
+
+    Supports comma-separated values so one run can evaluate multiple models:
+    --model_path models/A,models/B --model_name qwen,llama
+    """
+    model_paths = [m.strip() for m in model_path_arg.split(",") if m.strip()]
+    model_names = [m.strip().lower() for m in model_name_arg.split(",") if m.strip()]
+
+    if not model_paths:
+        raise ValueError("--model_path cannot be empty")
+
+    if len(model_names) == 1 and len(model_paths) > 1:
+        if model_names[0] == "auto":
+            model_names = [infer_model_name(path) for path in model_paths]
+        else:
+            model_names = model_names * len(model_paths)
+    elif len(model_names) == 0:
+        model_names = [infer_model_name(path) for path in model_paths]
+    elif len(model_names) != len(model_paths):
+        raise ValueError(
+            "When using multiple models, --model_name must be either one value, "
+            "'auto', or the same count as --model_path."
+        )
+
+    for model_name in model_names:
+        if model_name not in {"qwen", "llama"}:
+            raise ValueError(f"Unsupported model_name: {model_name}")
+
+    return list(zip(model_paths, model_names))
 
 
 class CoTModelWrapper(nn.Module):
