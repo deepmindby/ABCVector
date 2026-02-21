@@ -65,7 +65,7 @@ def main():
     # Load model
     print("\nLoading model...")
     model_wrapper = CoTModelWrapper(args.model_path, args.model_name)
-    tokenizer = load_tokenizer(args.model_path)
+    tokenizer = load_tokenizer(args.model_path, args.model_name)
     num_layers = model_wrapper.num_layers
     print(f"Model has {num_layers} layers")
     

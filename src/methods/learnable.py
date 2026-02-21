@@ -14,18 +14,18 @@ import gc
 
 from .base import BaseCoTVectorMethod
 from ..models import CoTModelWrapper
-from ..data_utils import PROMPT_TEMPLATES
+from ..data_utils import build_prompt
 
 
 class CoTDataset(Dataset):
     """Dataset for CoT vector training."""
     
-    def __init__(self, samples: List, tokenizer, dataset_type: str, max_length: int = 1024):
+    def __init__(self, samples: List, tokenizer, dataset_type: str, model_name: str, max_length: int = 1024):
         self.samples = samples
         self.tokenizer = tokenizer
         self.dataset_type = dataset_type
         self.max_length = max_length
-        self.prompt_template = PROMPT_TEMPLATES.get(dataset_type, PROMPT_TEMPLATES["gsm8k"])
+        self.model_name = model_name
     
     def __len__(self):
         return len(self.samples)
@@ -34,25 +34,24 @@ class CoTDataset(Dataset):
         sample = self.samples[idx]
         
         # Build prompts
-        if self.dataset_type == "mmlu_pro":
-            teacher_prompt = self.prompt_template["cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            ) + sample.cot + f"\nThe answer is {sample.answer}"
-            
-            student_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            ) + f"The answer is {sample.answer}"
-        else:
-            teacher_prompt = self.prompt_template["cot"].format(
-                question=sample.question
-            ) + sample.cot + f"\nThe answer is {sample.answer}"
-            
-            student_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question
-            ) + f"The answer is {sample.answer}"
-        
+        teacher_prompt = build_prompt(
+            template_key="cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_name,
+            assistant_text=f"{sample.cot or ''}\nThe answer is {sample.answer}",
+        )
+
+        student_prompt = build_prompt(
+            template_key="non_cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_name,
+            assistant_text=f"The answer is {sample.answer}",
+        )
+
         # Tokenize without padding (will pad in collate_fn)
         teacher_enc = self.tokenizer(
             teacher_prompt, 
@@ -84,6 +83,7 @@ class CoTDataset(Dataset):
             "teacher_len": teacher_len,
             "student_len": student_len,
             "answer_len": answer_len,
+            "pad_token_id": self.tokenizer.pad_token_id,
         }
 
 
@@ -101,13 +101,15 @@ def collate_fn(batch):
     student_lens = []
     answer_lens = []
     
+    pad_token_id = batch[0]["pad_token_id"]
+
     for item in batch:
         # Pad teacher
         t_ids = item["teacher_ids"]
         t_mask = item["teacher_mask"]
         t_pad_len = max_teacher_len - len(t_ids)
         if t_pad_len > 0:
-            t_ids = F.pad(t_ids, (0, t_pad_len), value=0)
+            t_ids = F.pad(t_ids, (0, t_pad_len), value=pad_token_id)
             t_mask = F.pad(t_mask, (0, t_pad_len), value=0)
         teacher_ids_list.append(t_ids)
         teacher_mask_list.append(t_mask)
@@ -117,7 +119,7 @@ def collate_fn(batch):
         s_mask = item["student_mask"]
         s_pad_len = max_student_len - len(s_ids)
         if s_pad_len > 0:
-            s_ids = F.pad(s_ids, (0, s_pad_len), value=0)
+            s_ids = F.pad(s_ids, (0, s_pad_len), value=pad_token_id)
             s_mask = F.pad(s_mask, (0, s_pad_len), value=0)
         student_ids_list.append(s_ids)
         student_mask_list.append(s_mask)
@@ -301,6 +303,7 @@ class LearnableCoTVector(BaseCoTVectorMethod):
             support_samples, 
             self.tokenizer, 
             self.dataset_type,
+            model_name=self.model_wrapper.model_name,
             max_length=self.max_length
         )
         dataloader = DataLoader(

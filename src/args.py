@@ -30,8 +30,8 @@ def parse_args():
         "--model_name",
         type=str,
         default="qwen",
-        choices=["qwen", "llama"],
-        help="Model type for architecture-specific handling"
+        help="Model type for architecture-specific handling. Supports comma-separated "
+             "values for multi-model runs, e.g. 'qwen,llama'. Use 'auto' to infer from --model_path."
     )
     parser.add_argument(
         "--data_path",

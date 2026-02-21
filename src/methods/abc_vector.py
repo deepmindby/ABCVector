@@ -25,7 +25,7 @@ import gc
 
 from .base import BaseCoTVectorMethod
 from ..models import CoTModelWrapper
-from ..data_utils import PROMPT_TEMPLATES
+from ..data_utils import build_prompt
 from ..eval import CoTEvaluator
 from ..utils import extract_answer_from_text, compare_answers
 
@@ -118,12 +118,12 @@ class PosteriorNetwork(nn.Module):
 class ABCDataset(Dataset):
     """Dataset for ABC Vector training with three prompt types."""
     
-    def __init__(self, samples: List, tokenizer, dataset_type: str, max_length: int = 1024):
+    def __init__(self, samples: List, tokenizer, dataset_type: str, model_name: str, max_length: int = 1024):
         self.samples = samples
         self.tokenizer = tokenizer
         self.dataset_type = dataset_type
         self.max_length = max_length
-        self.prompt_template = PROMPT_TEMPLATES.get(dataset_type, PROMPT_TEMPLATES["gsm8k"])
+        self.model_name = model_name
     
     def __len__(self):
         return len(self.samples)
@@ -132,40 +132,33 @@ class ABCDataset(Dataset):
         sample = self.samples[idx]
         
         # Build three types of prompts
-        if self.dataset_type == "mmlu_pro":
-            # A) Teacher prompt (with CoT + answer)
-            teacher_prompt = self.prompt_template["cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            ) + sample.cot + f"\nThe answer is {sample.answer}"
-            
-            # B) Student prompt full (non-CoT + answer, for training NLL)
-            student_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            ) + f"The answer is {sample.answer}"
-            
-            # C) Question only prompt (for prior input r_Q)
-            question_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question,
-                choices=sample.choices
-            )
-        else:
-            # A) Teacher prompt
-            teacher_prompt = self.prompt_template["cot"].format(
-                question=sample.question
-            ) + sample.cot + f"\nThe answer is {sample.answer}"
-            
-            # B) Student prompt full
-            student_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question
-            ) + f"The answer is {sample.answer}"
-            
-            # C) Question only prompt
-            question_prompt = self.prompt_template["non_cot"].format(
-                question=sample.question
-            )
-        
+        teacher_prompt = build_prompt(
+            template_key="cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_name,
+            assistant_text=f"{sample.cot or ''}\nThe answer is {sample.answer}",
+        )
+
+        student_prompt = build_prompt(
+            template_key="non_cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_name,
+            assistant_text=f"The answer is {sample.answer}",
+        )
+
+        question_prompt = build_prompt(
+            template_key="non_cot",
+            sample=sample,
+            dataset_type=self.dataset_type,
+            tokenizer=self.tokenizer,
+            model_name=self.model_name,
+            add_generation_prompt=True,
+        )
+
         # Tokenize all three
         teacher_enc = self.tokenizer(
             teacher_prompt,
@@ -207,6 +200,7 @@ class ABCDataset(Dataset):
             "student_len": student_len,
             "question_len": question_len,
             "answer_len": answer_len,
+            "pad_token_id": self.tokenizer.pad_token_id,
         }
 
 
@@ -228,13 +222,15 @@ def abc_collate_fn(batch):
     question_lens = []
     answer_lens = []
     
+    pad_token_id = batch[0]["pad_token_id"]
+
     for item in batch:
         # Pad teacher
         t_ids = item["teacher_ids"]
         t_mask = item["teacher_mask"]
         t_pad_len = max_teacher_len - len(t_ids)
         if t_pad_len > 0:
-            t_ids = F.pad(t_ids, (0, t_pad_len), value=0)
+            t_ids = F.pad(t_ids, (0, t_pad_len), value=pad_token_id)
             t_mask = F.pad(t_mask, (0, t_pad_len), value=0)
         teacher_ids_list.append(t_ids)
         teacher_mask_list.append(t_mask)
@@ -244,7 +240,7 @@ def abc_collate_fn(batch):
         s_mask = item["student_mask"]
         s_pad_len = max_student_len - len(s_ids)
         if s_pad_len > 0:
-            s_ids = F.pad(s_ids, (0, s_pad_len), value=0)
+            s_ids = F.pad(s_ids, (0, s_pad_len), value=pad_token_id)
             s_mask = F.pad(s_mask, (0, s_pad_len), value=0)
         student_ids_list.append(s_ids)
         student_mask_list.append(s_mask)
@@ -254,7 +250,7 @@ def abc_collate_fn(batch):
         q_mask = item["question_mask"]
         q_pad_len = max_question_len - len(q_ids)
         if q_pad_len > 0:
-            q_ids = F.pad(q_ids, (0, q_pad_len), value=0)
+            q_ids = F.pad(q_ids, (0, q_pad_len), value=pad_token_id)
             q_mask = F.pad(q_mask, (0, q_pad_len), value=0)
         question_ids_list.append(q_ids)
         question_mask_list.append(q_mask)
@@ -395,7 +391,7 @@ class ABCCoTVector(BaseCoTVectorMethod):
         self.gate = nn.Parameter(torch.tensor(0.0))
         
         # Prompt template
-        self.prompt_template = PROMPT_TEMPLATES.get(dataset_type, PROMPT_TEMPLATES["gsm8k"])
+        self.model_name = model_name
         
         # Training state
         self.trained = False
@@ -580,6 +576,7 @@ class ABCCoTVector(BaseCoTVectorMethod):
             support_samples,
             self.tokenizer,
             self.dataset_type,
+            model_name=self.model_wrapper.model_name,
             max_length=self.max_length,
         )
         dataloader = DataLoader(
@@ -878,23 +875,23 @@ class ABCCoTVector(BaseCoTVectorMethod):
         
         for sample in pbar:
             try:
-                # Build question_only_prompt
-                if self.dataset_type == "mmlu_pro":
-                    question_prompt = self.prompt_template["non_cot"].format(
-                        question=sample.question,
-                        choices=sample.choices
-                    )
-                    gen_prompt = self.prompt_template["cot"].format(
-                        question=sample.question,
-                        choices=sample.choices
-                    )
-                else:
-                    question_prompt = self.prompt_template["non_cot"].format(
-                        question=sample.question
-                    )
-                    gen_prompt = self.prompt_template["cot"].format(
-                        question=sample.question
-                    )
+                # Build prompts with model-specific formatting
+                question_prompt = build_prompt(
+                    template_key="non_cot",
+                    sample=sample,
+                    dataset_type=self.dataset_type,
+                    tokenizer=self.tokenizer,
+                    model_name=self.model_wrapper.model_name,
+                    add_generation_prompt=True,
+                )
+                gen_prompt = build_prompt(
+                    template_key="cot",
+                    sample=sample,
+                    dataset_type=self.dataset_type,
+                    tokenizer=self.tokenizer,
+                    model_name=self.model_wrapper.model_name,
+                    add_generation_prompt=True,
+                )
                 
                 # Tokenize question for r_Q
                 q_enc = self.tokenizer(
