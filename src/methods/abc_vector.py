@@ -44,9 +44,9 @@ class PriorNetwork(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
         )
         self.mu_head = nn.Linear(hidden_dim, output_dim)
         self.sigma_head = nn.Linear(hidden_dim, output_dim)
