@@ -200,6 +200,61 @@ def parse_args():
         help="Learning rate for ABC networks (prior, posterior, gate)"
     )
     
+    # ==================== ABC Posterior Mode (Ablation) ====================
+    # Controls what privileged information the posterior network receives.
+    #
+    # Theoretical interpretation:
+    #   q_y_qca : q(z | Q, Y_{Q;C;A})  — posterior sees full teacher output (Q + CoT + Answer).
+    #                                      This is the default and strongest privileged signal.
+    #   q_y_qc  : q(z | Q, Y_{Q;C})    — posterior sees Q + CoT only (no answer leak).
+    #                                      Tests whether CoT reasoning is sufficient supervision.
+    #   q_y_q   : q(z | Q, Y_Q)        — posterior sees only question features (Y = r_Q).
+    #                                      Posterior degenerates to f(r_Q, r_Q); tests whether
+    #                                      a second network on the same input adds capacity.
+    #   none    : q(z | Q) = p(z | Q)  — no separate posterior; training samples z from prior.
+    #                                      KL = 0 by construction, pure prior-only training.
+    #                                      Equivalent to removing the variational inference.
+    parser.add_argument(
+        "--posterior_mode",
+        type=str,
+        default="q_y_qca",
+        choices=["q_y_qca", "q_y_qc", "q_y_q", "none"],
+        help=(
+            "Posterior information ablation mode.\n"
+            "  q_y_qca: Y from [Q; CoT; Answer] (default, full privileged info)\n"
+            "  q_y_qc:  Y from [Q; CoT] (no answer tokens)\n"
+            "  q_y_q:   Y = r_Q (question only, tests posterior capacity)\n"
+            "  none:    No posterior, train with prior only (KL=0)"
+        )
+    )
+    
+    # ==================== ABC Diagnostics ====================
+    parser.add_argument(
+        "--save_diagnostics",
+        action="store_true",
+        default=False,
+        help="Save detailed training diagnostics (mu gap, sigma stats, etc.) to jsonl"
+    )
+    parser.add_argument(
+        "--diagnostic_split",
+        type=str,
+        default="both",
+        choices=["support", "test", "both"],
+        help="Which split(s) to run diagnostic evaluation on"
+    )
+    parser.add_argument(
+        "--run_posterior_eval",
+        action="store_true",
+        default=False,
+        help="Run evaluation using posterior mean z* = mu_psi(Q, Y) (requires teacher features at eval time)"
+    )
+    parser.add_argument(
+        "--run_prior_eval",
+        action="store_true",
+        default=False,
+        help="Run evaluation using prior mean z* = mu_phi(Q) (this is the standard ABC eval)"
+    )
+    
     # ==================== Generation Configuration (Evaluation) ====================
     parser.add_argument(
         "--max_new_tokens",
@@ -222,7 +277,7 @@ def parse_args():
     parser.add_argument(
         "--use_early_stopping",
         action="store_true",
-        default=False,
+        default=True,
         help="Stop when answer pattern detected"
     )
     
@@ -277,7 +332,8 @@ def parse_args():
         "--layers",
         type=str,
         default=None,
-        help="Comma-separated layers to test (e.g., '0,5,10'). Default: all layers with step"
+        help="Comma-separated layers to test (e.g., '0,5,10'). "
+             "Default: all layers with step"
     )
     parser.add_argument(
         "--layer_step",

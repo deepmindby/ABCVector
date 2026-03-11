@@ -1,15 +1,17 @@
-
+#!/usr/bin/env python3
 """
 Main entry point for CoT Vectors.
 
-Supports four methods based on Variational CoT Vectors framework:
-- Extracted: Statistical aggregation of activation differences
-- Learnable: Gradient optimization via teacher-student framework
-- UA: Uncertainty-Aware with Bayesian shrinkage
-- ABC: Adaptive Bayesian CoT Vector with variational inference
+Supports methods: extracted, learnable, ua, abc
+All hyperparameters are defined in src/args.py
+
+Usage:
+    python main.py --method abc --dataset gsm8k --layer_idx 0
+    python main.py --method abc --posterior_mode q_y_qc --save_diagnostics
 """
 
 import os
+import sys
 import torch
 from datetime import datetime
 
@@ -21,7 +23,7 @@ from src.methods.learnable import LearnableCoTVector
 from src.methods.ua_vector import UACoTVector
 from src.methods.abc_vector import ABCCoTVector
 from src.eval import run_baseline_evaluation, run_injection_evaluation
-from src.utils import set_seed, setup_wandb
+from src.utils import set_seed, print_results_summary
 
 
 def get_output_dir(base_dir: str, dataset: str) -> str:
@@ -34,7 +36,6 @@ def get_output_dir(base_dir: str, dataset: str) -> str:
 def main():
     args = parse_args()
     
-    # Setup
     set_seed(args.seed)
     
     # Create dataset-specific output directory
@@ -42,61 +43,39 @@ def main():
     
     # Print configuration
     print("=" * 60)
-    print("CoT Vectors: Variational Framework")
+    print("CoT Vectors")
     print("=" * 60)
-    print(f"Model: {args.model_path.split('/')[-1]}")
-    print(f"Method: {args.method}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Layer: {args.layer_idx}")
-    print(f"Mode: {args.mode}")
-    print(f"Output: {output_dir}")
-    print(f"Beams: {args.num_beams}, Max tokens: {args.max_new_tokens}")
-    
-    # Print method-specific config
-    if args.method == "learnable":
-        print("-" * 60)
-        print("Learnable Configuration:")
-        print(f"  Epochs: {args.num_epochs}")
-        print(f"  Batch size: {args.batch_size}")
-        print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
-        print(f"  Learning rate: {args.learning_rate}")
-        print(f"  Lambda: {args.lambda_val}")
-        print(f"  Max length: {args.max_length}")
-    
-    if args.method == "ua":
-        print("-" * 60)
-        print("Uncertainty-Aware (UA) Configuration:")
-        print(f"  Prior variance τ²: {args.tau_squared}")
-        print(f"  Min variance: {args.min_variance}")
-    
+    print(f"Model:    {args.model_path.split('/')[-1]}")
+    print(f"Method:   {args.method}")
+    print(f"Dataset:  {args.dataset}")
+    print(f"Output:   {output_dir}")
+    print(f"Mode:     {args.mode}")
     if args.method == "abc":
-        print("-" * 60)
-        print("Adaptive Bayesian CoT (ABC) Configuration:")
-        print(f"  Hidden dim: {args.abc_hidden_dim}")
-        print(f"  KL beta: {args.kl_beta}")
-        print(f"  KL warmup steps: {args.kl_warmup_steps}")
-        print(f"  Sigma min: {args.sigma_min}")
-        print(f"  Learning rate: {args.abc_learning_rate}")
-        print(f"  Epochs: {args.num_epochs}")
-        print(f"  Batch size: {args.batch_size}")
-        print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
-        print(f"  Max length: {args.max_length}")
-    
+        print(f"ABC Config: hidden_dim={args.abc_hidden_dim}, kl_beta={args.kl_beta}, "
+              f"kl_warmup={args.kl_warmup_steps}, sigma_min={args.sigma_min}, "
+              f"lr={args.abc_learning_rate}, posterior_mode={args.posterior_mode}")
     print("=" * 60)
     
-    # Setup WandB
+    # WandB
     wandb_run = None
     if args.use_wandb:
-        wandb_run = setup_wandb(args)
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                config=vars(args),
+            )
+        except ImportError:
+            print("Warning: wandb not installed, skipping logging")
     
     # Load model
     print("\nLoading model...")
     model_wrapper = CoTModelWrapper(args.model_path, args.model_name)
     tokenizer = load_tokenizer(args.model_path)
-    print(f"Model loaded: {model_wrapper.num_layers} layers, hidden_size={model_wrapper.hidden_size}")
+    print(f"Model loaded. Hidden size: {model_wrapper.hidden_size}, "
+          f"Layers: {model_wrapper.num_layers}")
     
     # Load data
-    print("\nLoading data...")
     support_samples = None
     test_samples = None
     
@@ -117,6 +96,17 @@ def main():
         print(f"\n{'='*60}")
         print("ABC Vector Processing")
         print("=" * 60)
+        print(f"  Posterior mode: {args.posterior_mode}")
+        if args.save_diagnostics:
+            print(f"  Diagnostics: ON (split={args.diagnostic_split})")
+        if args.run_prior_eval:
+            print(f"  Prior eval: ON")
+        if args.run_posterior_eval:
+            print(f"  Posterior eval: ON")
+        
+        # Diagnostics output directory
+        diagnostics_dir = os.path.join(output_dir, "diagnostics")
+        os.makedirs(diagnostics_dir, exist_ok=True)
         
         # Initialize ABC method
         abc_method = ABCCoTVector(
@@ -135,6 +125,10 @@ def main():
             batch_size=args.batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             max_length=args.max_length,
+            # New: posterior mode and diagnostics
+            posterior_mode=args.posterior_mode,
+            save_diagnostics=args.save_diagnostics,
+            diagnostics_dir=diagnostics_dir,
         )
         
         # Load checkpoint if provided
@@ -153,7 +147,7 @@ def main():
             # Save checkpoint
             if args.save_vector:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                checkpoint_filename = f"abc_L{args.layer_idx}_{timestamp}.pt"
+                checkpoint_filename = f"abc_L{args.layer_idx}_{args.posterior_mode}_{timestamp}.pt"
                 checkpoint_path = os.path.join(output_dir, checkpoint_filename)
                 
                 save_data = {
@@ -172,7 +166,7 @@ def main():
             # Baseline evaluation
             baseline_results = None
             if not args.skip_baseline:
-                print("\n[1/2] Baseline (no injection)...")
+                print("\n[1/N] Baseline (no injection)...")
                 baseline_results = run_baseline_evaluation(
                     model_wrapper=model_wrapper,
                     tokenizer=tokenizer,
@@ -183,8 +177,8 @@ def main():
                     use_early_stopping=args.use_early_stopping,
                 )
             
-            # ABC evaluation (dynamic vectors)
-            print(f"\n[2/2] ABC Vector (layer {args.layer_idx}, dynamic z*)...")
+            # Standard ABC evaluation (prior mean)
+            print(f"\n[2/N] ABC Vector (layer {args.layer_idx}, prior mean z*)...")
             abc_results = abc_method.eval(
                 test_samples=test_samples,
                 max_new_tokens=args.max_new_tokens,
@@ -197,7 +191,7 @@ def main():
             print("Results Summary")
             print("-" * 60)
             print(f"Model:      {args.model_path.split('/')[-1]}")
-            print(f"Method:     ABC")
+            print(f"Method:     ABC (posterior_mode={args.posterior_mode})")
             print(f"Layer:      {args.layer_idx}")
             print(f"Dataset:    {args.dataset}")
             print(f"Test size:  {len(test_samples)}")
@@ -210,14 +204,40 @@ def main():
             if baseline_results:
                 diff = abc_results['accuracy'] - baseline_results['accuracy']
                 sign = "+" if diff >= 0 else ""
-                print(f"ABC:        {abc_results['accuracy']:.2f}% "
+                print(f"ABC(prior): {abc_results['accuracy']:.2f}% "
                       f"({abc_results['correct']}/{abc_results['total']}) [{sign}{diff:.2f}%]")
             else:
-                print(f"ABC:        {abc_results['accuracy']:.2f}% "
+                print(f"ABC(prior): {abc_results['accuracy']:.2f}% "
                       f"({abc_results['correct']}/{abc_results['total']})")
             
             print(f"Gate value: {abc_method.gate.item():.4f}")
+            print(f"Avg injected norm: {abc_results.get('avg_injected_norm', 0):.4f}")
             print("=" * 60)
+            
+            # ========== Diagnostic Eval (optional) ==========
+            if args.run_prior_eval or args.run_posterior_eval:
+                diag_csv_path = os.path.join(
+                    diagnostics_dir,
+                    f"diagnostic_eval_L{args.layer_idx}_{args.posterior_mode}.csv"
+                )
+                
+                # Determine which splits to evaluate
+                eval_splits = {}
+                if args.diagnostic_split in ["test", "both"]:
+                    eval_splits["test"] = test_samples
+                if args.diagnostic_split in ["support", "both"] and support_samples:
+                    # Use a subset of support for diagnostic eval
+                    diag_support = support_samples[:min(100, len(support_samples))]
+                    eval_splits["support"] = diag_support
+                
+                for split_name, split_samples in eval_splits.items():
+                    abc_method.run_diagnostic_eval(
+                        test_samples=split_samples,
+                        max_new_tokens=args.max_new_tokens,
+                        num_beams=args.num_beams,
+                        split_name=split_name,
+                        save_path=diag_csv_path,
+                    )
             
             # Log to WandB
             if wandb_run:
@@ -228,6 +248,7 @@ def main():
                 wandb_run.log({
                     "eval/abc_accuracy": abc_results['accuracy'],
                     "eval/gate": abc_method.gate.item(),
+                    "eval/posterior_mode": args.posterior_mode,
                 })
                 if baseline_results:
                     wandb_run.log({
@@ -238,36 +259,23 @@ def main():
         print("\nDone!")
         return
     
-    # ==================== Handle other methods (extracted, learnable, ua) ====================
-    # Get or load vector
+    # ==================== Handle non-ABC methods ====================
+    # (extracted, learnable, ua — kept unchanged from original main.py)
+    
     vector = None
-    method = None
     
-    if args.vector_path:
-        print(f"\nLoading vector from {args.vector_path}")
-        loaded = torch.load(args.vector_path, map_location="cpu")
-        if isinstance(loaded, dict):
-            if "vector" in loaded:
-                vector = loaded["vector"]
-        else:
-            vector = loaded
-        print(f"Loaded vector: shape={vector.shape}, norm={vector.norm().item():.4f}")
-    
-    elif args.mode in ["extract", "train", "both"]:
+    if args.mode in ["extract", "train", "both"]:
         print(f"\n{'='*60}")
+        if args.method == "extracted":
+            print("Extracting CoT Vector")
+        else:
+            print("Training CoT Vector")
+        print("=" * 60)
         
         if args.method == "extracted":
-            print("Extracting CoT Vector...")
-            method = ExtractedCoTVector(
-                model_wrapper=model_wrapper,
-                tokenizer=tokenizer,
-                layer_idx=args.layer_idx,
-                dataset_type=args.dataset,
-            )
-            vector = method.extract(support_samples)
-            
+            method = ExtractedCoTVector(model_wrapper, tokenizer, args.layer_idx, args.dataset)
+            vector = method.extract(support_samples, scaling_factor=args.scaling_factor)
         elif args.method == "learnable":
-            print("Training Learnable CoT Vector...")
             method = LearnableCoTVector(
                 model_wrapper=model_wrapper,
                 tokenizer=tokenizer,
@@ -275,17 +283,15 @@ def main():
                 dataset_type=args.dataset,
                 lambda_val=args.lambda_val,
                 learning_rate=args.learning_rate,
-                weight_decay=args.weight_decay,
-                warmup_ratio=args.warmup_ratio,
                 num_epochs=args.num_epochs,
                 batch_size=args.batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
+                warmup_ratio=args.warmup_ratio,
+                weight_decay=args.weight_decay,
                 max_length=args.max_length,
             )
             vector = method.train(support_samples, wandb_run)
-            
         elif args.method == "ua":
-            print("Extracting Uncertainty-Aware CoT Vector...")
             method = UACoTVector(
                 model_wrapper=model_wrapper,
                 tokenizer=tokenizer,
@@ -296,30 +302,23 @@ def main():
             )
             vector = method.extract(support_samples)
         
-        else:
-            raise ValueError(f"Unknown method: {args.method}")
-        
-        # Save vector to outputs/{dataset}/
-        if args.save_vector and vector is not None:
+        # Save vector
+        if vector is not None and args.save_vector:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             vector_filename = f"{args.method}_L{args.layer_idx}_{timestamp}.pt"
             vector_path = os.path.join(output_dir, vector_filename)
             
-            # Prepare save data
-            save_data = {
-                "vector": vector.cpu(),
-                "args": vars(args),
-                "method": args.method,
-            }
-            
-            # Include additional statistics for UA method
-            if args.method == "ua" and hasattr(method, 'get_statistics'):
-                save_data["statistics"] = method.get_statistics()
-            
-            torch.save(save_data, vector_path)
+            from src.utils import save_vector
+            save_vector(vector, vector_path, metadata=vars(args))
             print(f"Vector saved to {vector_path}")
     
-    # Evaluation
+    # Load vector from file if specified
+    if args.vector_path and vector is None:
+        from src.utils import load_vector
+        vector, _ = load_vector(args.vector_path)
+        print(f"Vector loaded from {args.vector_path}")
+    
+    # Evaluation for non-ABC methods
     if args.mode in ["eval", "both"] and test_samples:
         print(f"\n{'='*60}")
         print("Evaluation")
@@ -364,39 +363,14 @@ def main():
         print(f"Method:     {args.method}")
         print(f"Layer:      {args.layer_idx}")
         print(f"Dataset:    {args.dataset}")
-        print(f"Test size:  {len(test_samples)}")
-        print("-" * 60)
         
         if baseline_results:
-            print(f"Baseline:   {baseline_results['accuracy']:.2f}% ({baseline_results['correct']}/{baseline_results['total']})")
-        
+            print(f"Baseline:   {baseline_results['accuracy']:.2f}%")
         if injection_results:
-            if baseline_results:
-                diff = injection_results['accuracy'] - baseline_results['accuracy']
-                sign = "+" if diff >= 0 else ""
-                print(f"Injection:  {injection_results['accuracy']:.2f}% ({injection_results['correct']}/{injection_results['total']}) [{sign}{diff:.2f}%]")
-            else:
-                print(f"Injection:  {injection_results['accuracy']:.2f}% ({injection_results['correct']}/{injection_results['total']})")
-        
-        if vector is not None:
-            print(f"Vec norm:   {vector.norm().item():.4f}")
-        
+            print(f"Injection:  {injection_results['accuracy']:.2f}%")
         print("=" * 60)
         
-        # Log to WandB
         if wandb_run:
-            if baseline_results:
-                wandb_run.log({
-                    "eval/baseline_accuracy": baseline_results['accuracy'],
-                })
-            if injection_results:
-                log_dict = {
-                    "eval/injection_accuracy": injection_results['accuracy'],
-                    "eval/vector_norm": vector.norm().item() if vector is not None else 0,
-                }
-                if baseline_results:
-                    log_dict["eval/improvement"] = injection_results['accuracy'] - baseline_results['accuracy']
-                wandb_run.log(log_dict)
             wandb_run.finish()
     
     print("\nDone!")

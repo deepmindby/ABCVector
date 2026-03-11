@@ -1,0 +1,3 @@
+split,posterior_mode,layer_idx,prior_accuracy,posterior_accuracy,accuracy_delta,prior_avg_norm,posterior_avg_norm,norm_delta,gate_value,num_samples,timestamp
+test,none,0,88.2,88.2,0.0,0.002693,0.002693,0.0,-0.003637,500,2026-03-11 22:37:06
+support,none,0,90.0,90.0,0.0,0.002697,0.002697,0.0,-0.003637,100,2026-03-11 22:59:40
