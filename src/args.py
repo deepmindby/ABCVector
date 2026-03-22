@@ -2,13 +2,14 @@
 Argument parser for CoT Vectors.
 All hyperparameters are defined here.
 
-Supports: Extracted, Learnable, Uncertainty-Aware (UA), and ABC methods.
+Supports: Extracted, Learnable, Uncertainty-Aware (UA), ABC, and HABC methods.
 
 Based on "Variational CoT Vectors" framework:
 - Extracted: Statistical aggregation to approximate posterior
 - Learnable: Gradient optimization for global reasoning patterns
 - UA: Bayesian shrinkage with uncertainty-aware gating
 - ABC: Adaptive Bayesian CoT Vector with variational inference
+- HABC: Hierarchical ABC with two-layer latent (global + instance)
 """
 
 import argparse
@@ -57,8 +58,8 @@ def parse_args():
         "--method",
         type=str,
         default="extracted",
-        choices=["extracted", "learnable", "ua", "abc"],
-        help="CoT Vector acquisition method: extracted, learnable, ua, or abc"
+        choices=["extracted", "learnable", "ua", "abc", "habc"],
+        help="CoT Vector acquisition method: extracted, learnable, ua, abc, or habc"
     )
     parser.add_argument(
         "--mode",
@@ -202,6 +203,7 @@ def parse_args():
     
     # ==================== ABC Posterior Mode (Ablation) ====================
     # Controls what privileged information the posterior network receives.
+    # Used by both ABC and HABC methods.
     #
     # Theoretical interpretation:
     #   q_y_qca : q(z | Q, Y_{Q;C;A})  — posterior sees full teacher output (Q + CoT + Answer).
@@ -253,6 +255,78 @@ def parse_args():
         action="store_true",
         default=False,
         help="Run evaluation using prior mean z* = mu_phi(Q) (this is the standard ABC eval)"
+    )
+    
+    # ==================== HABC Vector Configuration ====================
+    # Hierarchical Adaptive Bayesian CoT Vector with two-layer latent variables.
+    # Global latent z_g (task-level) + Instance latent z_i (sample-level).
+    # No gate parameter g; amplitude controlled by projection heads W_g, W_i.
+    # Injection: v_i = W_g(z_g) + W_i(z_i)
+    parser.add_argument(
+        "--habc_hidden_dim",
+        type=int,
+        default=512,
+        help="Hidden dimension for HABC prior/posterior MLP networks"
+    )
+    parser.add_argument(
+        "--global_latent_dim",
+        type=int,
+        default=256,
+        help="Dimension of global latent z_g"
+    )
+    parser.add_argument(
+        "--instance_latent_dim",
+        type=int,
+        default=256,
+        help="Dimension of instance latent z_i"
+    )
+    parser.add_argument(
+        "--kl_beta_global",
+        type=float,
+        default=0.1,
+        help="KL weight for global latent KL(q(z_g|S) || N(0,I))"
+    )
+    parser.add_argument(
+        "--kl_beta_instance",
+        type=float,
+        default=0.1,
+        help="KL weight for instance latent KL(q(z_i|Q,Y,z_g) || p(z_i|Q,z_g))"
+    )
+    parser.add_argument(
+        "--kl_warmup_steps_global",
+        type=int,
+        default=0,
+        help="KL warmup steps for global KL (0 = no warmup)"
+    )
+    parser.add_argument(
+        "--kl_warmup_steps_instance",
+        type=int,
+        default=0,
+        help="KL warmup steps for instance KL (0 = no warmup)"
+    )
+    parser.add_argument(
+        "--sigma_min_global",
+        type=float,
+        default=1e-4,
+        help="Minimum sigma for global latent (numerical stability)"
+    )
+    parser.add_argument(
+        "--sigma_min_instance",
+        type=float,
+        default=1e-4,
+        help="Minimum sigma for instance latent (numerical stability)"
+    )
+    parser.add_argument(
+        "--habc_learning_rate",
+        type=float,
+        default=1e-4,
+        help="Learning rate for HABC networks (global posterior, instance prior/posterior, projections)"
+    )
+    parser.add_argument(
+        "--habc_checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to load pre-trained HABC checkpoint"
     )
     
     # ==================== Generation Configuration (Evaluation) ====================

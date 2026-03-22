@@ -14,6 +14,9 @@ Available methods based on Variational CoT Vectors framework:
 
 - ABCCoTVector: Adaptive Bayesian CoT Vector with variational inference
   Prior-posterior networks for dynamic, sample-specific vector injection.
+
+- HierarchicalABCCoTVector: Two-layer hierarchical variational CoT Vector
+  Global + instance latent variables with projection-based injection (no gate).
 """
 
 from .base import BaseCoTVectorMethod
@@ -21,6 +24,7 @@ from .extracted import ExtractedCoTVector
 from .learnable import LearnableCoTVector
 from .ua_vector import UACoTVector
 from .abc_vector import ABCCoTVector
+from .habc_vector import HierarchicalABCCoTVector
 
 __all__ = [
     "BaseCoTVectorMethod",
@@ -28,4 +32,5 @@ __all__ = [
     "LearnableCoTVector",
     "UACoTVector",
     "ABCCoTVector",
+    "HierarchicalABCCoTVector",
 ]
